@@ -1,0 +1,594 @@
+---
+name: "Social Media - Mastodon - Firefox (smoke, headful)"
+author: Didi Hoffmann <didi@green-coding.io>
+description: "Mastodon web client on a configurable instance, home timeline plus the shared anchor profile. One flow step per action so every action lands in its own GMT phase."
+
+compose-file: !include-gmt-helper gmt-playwright-headful-with-cache.yml
+
+# Emitted from inside the browser via logNote() as "<microsecond timestamp> <key>=<int>"
+# and scraped from the detached IPC process stdout. Values are attributed to whichever
+# phase was active when they were emitted, so every phase carries its own page weight.
+custom_metrics:
+  page_load_ms:
+    unit: ms
+  page_dom_content_loaded_ms:
+    unit: ms
+  page_transfer_bytes:
+    unit: Bytes
+  page_requests:
+    unit: Requests
+  page_dom_nodes:
+    unit: Nodes
+  feed_posts_rendered:
+    unit: Posts
+  scroll_ticks:
+    unit: Ticks
+
+services:
+  gmt-playwright-nodejs:
+    read-notes-stdout: true
+    # Credentials travel as container env vars rather than being string-replaced into the
+    # Playwright commands. Two reasons: the IPC process echoes every command it evaluates
+    # to stdout (which lands in the run log), and env var values may contain any character
+    # while commands sent over the IPC FIFO may not contain a single quote.
+    #
+    # The literal block scalars are load bearing. GMT substitutes __GMT_VAR_*__ into this
+    # file as raw text *before* the YAML is parsed, so a credential starting with @ or %,
+    # or containing a quote or a colon, would otherwise be a YAML syntax error rather than
+    # a password. Inside a block scalar every character is literal, so nothing needs escaping.
+    environment:
+      GMT_SM_USERNAME: |-
+        __GMT_VAR_SECRET_USERNAME__
+      GMT_SM_PASSWORD: |-
+        __GMT_VAR_SECRET_PASSWORD__
+
+# Replaces the helper partial's own flow-prepend so the browser launch is visible and
+# tunable here, and so the IPC process stdout is read for notes and custom metrics.
+# See README.md for switching a full run to headful.
+flow-prepend:
+  - name: Starting browser IPC
+    container: gmt-playwright-nodejs
+    hidden: true
+    commands:
+      - type: console
+        command: node /tmp/gmt-utils/gmt-playwright-ipc.js --headless false --browser firefox --proxy http://squid:3128
+        note: Starting browser in background process with IPC
+        detach: true
+        read-notes-stdout: true
+      - type: console
+        command: timeout 10 bash -c 'until [ -p "/tmp/playwright-ipc-ready" ]; do sleep 1; done && echo "Browser ready!"'
+        shell: bash
+        note: Waiting for website stepper loop to start by monitoring rendezvous file endpoint
+
+flow:
+  # Shared harness, generated identically into every scenario by build_scenarios.py.
+  # No single quotes anywhere below: GMT ships each command through
+  # `bash -ec "echo <command> > <fifo>"`, which a single quote would break.
+  # Use backticks for selectors that need embedded double quotes.
+  - name: Setup Browser Harness
+    container: gmt-playwright-nodejs
+    hidden: true
+    commands:
+      - type: playwright
+        shell: bash
+        command: |
+          gmtCtxOpts = {viewport: {width: 1920, height: 1080}, locale: "en-US", timezoneId: "Europe/Berlin", ignoreHTTPSErrors: true};
+          gmtInit = () => {
+            Object.defineProperty(navigator, "webdriver", {get: () => false});
+            // Counting via an observer rather than reading the resource timing buffer: several of
+            // these apps call performance.clearResourceTimings(), which silently zeroes the buffer
+            // mid-session. Verified on X, where buffer reads flatlined while the DOM kept growing.
+            window.__gmtBytes = 0;
+            window.__gmtRequests = 0;
+            try {
+              performance.setResourceTimingBufferSize(20000);
+              const observer = new PerformanceObserver((list) => {
+                for (const entry of list.getEntries()) {
+                  window.__gmtBytes = window.__gmtBytes + (entry.transferSize || 0);
+                  window.__gmtRequests = window.__gmtRequests + 1;
+                }
+              });
+              observer.observe({type: "resource", buffered: true});
+            } catch (e) { }
+          };
+          gmtNewContext = async () => {
+            if (context) { await context.close(); }
+            context = await browser.newContext(gmtCtxOpts);
+            // Deliberately below the hard 60s cap GMT puts on a playwright command, so a stuck locator
+            // surfaces as a readable Playwright error rather than a bare docker exec timeout.
+            context.setDefaultTimeout(20000);
+            context.setDefaultNavigationTimeout(30000);
+            await context.addInitScript(gmtInit);
+            // Some platforms pick their UI language from the request IP rather than Accept-Language.
+            // LinkedIn served German to a machine in Germany, which breaks every text matcher and
+            // makes runs from different locations incomparable. S.cookies pins it.
+            if (typeof S !== "undefined" && S.cookies) { await context.addCookies(S.cookies); }
+            page = await context.newPage();
+          };
+          gmtRnd = (min, max) => min + Math.floor(Math.random() * (max - min));
+          gmtHuman = async () => { await sleep(gmtRnd(400, 1400)); };
+          gmtVisible = async (loc) => { try { return await loc.first().isVisible({timeout: 5000}); } catch (e) { return false; } };
+          // Waits for something a step needs. Returns null and warns instead of throwing, so one
+          // stale selector costs that step rather than the whole run. Steps where a failure would
+          // invalidate everything downstream (Login, the feed status check) still throw.
+          gmtNeed = async (loc, label) => {
+            try { await loc.first().waitFor({state: "visible", timeout: 20000}); return loc.first(); }
+            catch (e) { logNote(`WARNING step skipped, ${label} not found`); return null; }
+          };
+      - type: playwright
+        shell: bash
+        command: |
+          // Consent sheets and sign-up banners overlay the page, so Playwright refuses to click
+          // what is underneath even though it is visible. Verified on X and Threads: .click()
+          // times out where a DOM click goes straight through. Try the honest click first, since
+          // it is the one that dispatches realistic events, then fall back.
+          gmtClick = async (loc, label) => {
+            const l = loc.first();
+            try { await l.click({timeout: 15000}); return true; }
+            catch (e) {
+              try { await l.evaluate((el) => el.click()); return true; }
+              catch (e2) { logNote(`WARNING click failed, ${label}`); return false; }
+            }
+          };
+          gmtType = async (loc, text) => {
+            const l = loc.first();
+            try { await l.click({timeout: 10000}); } catch (e) { await l.focus(); }
+            await gmtHuman();
+            // A 200 character post at a full human cadence is ~24s of typing, which overruns both
+            // the 20s action timeout and a meaningful slice of the 60s command budget. Keep the
+            // per-key delay human for short fields and scale it down for post-length text.
+            const delay = text.length > 60 ? gmtRnd(25, 55) : gmtRnd(80, 160);
+            await l.pressSequentially(text, {delay: delay, timeout: 45000});
+          };
+          // S.consent lists the button labels to try, most privacy preserving first. Matching on
+          // exact innerText because none of these platforms give the buttons a stable attribute.
+          gmtDismissConsent = async () => {
+            if (!S.consent || S.consent.length === 0) { return null; }
+            const hit = await page.evaluate((wanted) => {
+              const nodes = Array.from(document.querySelectorAll("button,[role=button],div[role=button],a"));
+              for (const w of wanted) {
+                const el = nodes.find((n) => (n.innerText || "").trim() === w && n.offsetParent !== null);
+                if (el) { el.click(); return w; }
+              }
+              return null;
+            }, S.consent);
+            if (hit) { logNote(`consent dismissed via ${hit}`); await sleep(5000); }
+            else { logNote("no consent dialog found"); }
+            return hit;
+          };
+      - type: playwright
+        shell: bash
+        command: |
+          gmtNote = (k, v) => { logNote(`${k}=${Math.max(0, Math.round(v || 0))}`); };
+          gmtCount = async (sel) => { try { return await page.locator(sel).count(); } catch (e) { return 0; } };
+          gmtReportPage = async () => {
+            const m = await page.evaluate(() => {
+              const nav = performance.getEntriesByType("navigation")[0];
+              const observed = window.__gmtBytes || 0;
+              const requests = window.__gmtRequests || performance.getEntriesByType("resource").length;
+              return {load: nav ? nav.duration : 0, dcl: nav ? nav.domContentLoadedEventEnd : 0, bytes: observed + (nav ? (nav.transferSize || 0) : 0), req: requests, nodes: document.getElementsByTagName("*").length};
+            });
+            gmtNote("page_load_ms", m.load);
+            gmtNote("page_dom_content_loaded_ms", m.dcl);
+            gmtNote("page_transfer_bytes", m.bytes);
+            gmtNote("page_requests", m.req);
+            gmtNote("page_dom_nodes", m.nodes);
+          };
+      - type: playwright
+        shell: bash
+        command: |
+          gmtFocus = async () => { if (S.feedHover) { try { await page.locator(S.feedHover).first().hover({timeout: 5000}); } catch (e) { } } else { try { await page.mouse.move(960, 540); } catch (e) { } } };
+          // page.mouse.wheel has no actionability timeout and can block indefinitely on a busy
+          // virtualised feed - observed once on Mastodon at 845s for a single tick, which GMT
+          // would have killed at 60s. Race every tick against a wall clock.
+          gmtWithTimeout = async (promise, ms, label) => {
+            let timer = null;
+            const guard = new Promise((resolve, reject) => { timer = setTimeout(() => reject(new Error(`gmt timeout after ${ms}ms: ${label}`)), ms); });
+            try { return await Promise.race([promise, guard]); }
+            finally { clearTimeout(timer); }
+          };
+          gmtWheel = async () => {
+            try { await gmtWithTimeout(page.mouse.wheel(0, gmtRnd(200, 460)), 6000, "mouse.wheel"); return true; }
+            catch (e) { logNote("WARNING scroll tick stalled, ending this chunk early"); return false; }
+          };
+          // GMT kills any single playwright command at 60s (lib/scenario_runner.py), so a long
+          // scroll is emitted as several short chunks inside one flow step. Ticks accumulate in a
+          // global across the chunks and are reported once, so the phase still gets one figure.
+          GMT_TICKS = 0;
+          gmtScrollReset = () => { GMT_TICKS = 0; };
+          gmtScrollChunk = async (seconds) => {
+            await gmtFocus();
+            const deadline = Date.now() + (seconds * 1000);
+            while (Date.now() < deadline) {
+              if (!await gmtWheel()) { break; }
+              GMT_TICKS = GMT_TICKS + 1;
+              await sleep(gmtRnd(150, 450));
+            }
+          };
+          gmtTickChunk = async (n) => {
+            await gmtFocus();
+            const deadline = Date.now() + 40000;
+            for (let i = 0; i < n; i++) {
+              if (!await gmtWheel()) { break; }
+              GMT_TICKS = GMT_TICKS + 1;
+              await sleep(gmtRnd(150, 450));
+              if (Date.now() > deadline) { logNote("WARNING tick chunk hit its time guard"); break; }
+            }
+          };
+          gmtScrollReport = async (sel) => {
+            gmtNote("scroll_ticks", GMT_TICKS);
+            gmtNote("feed_posts_rendered", await gmtCount(sel));
+            await gmtReportPage();
+          };
+          gmtSettle = async (sel) => {
+            gmtNote("feed_posts_rendered", await gmtCount(sel));
+            await gmtReportPage();
+          };
+          gmtTop = async () => {
+            await gmtFocus();
+            if (S.scrollRoot) { await page.evaluate((sel) => { const el = document.querySelector(sel); if (el) { el.scrollTo({top: 0, behavior: "smooth"}); } }, S.scrollRoot); }
+            else { await page.evaluate(() => window.scrollTo({top: 0, behavior: "smooth"})); }
+            await sleep(4000);
+          };
+          gmtOpenFeed = async (url) => {
+            page_result = await page.goto(url, {waitUntil: "domcontentloaded"});
+            await sleep(3000);
+            await gmtDismissConsent();
+            try { await page.locator(S.post).first().waitFor({state: "visible", timeout: 20000}); } catch (e) { logNote(`WARNING no feed item matched ${S.post} on ${url}`); }
+            await sleep(4000);
+            await gmtSettle(S.post);
+          };
+  # S is the only platform specific part. Everything else reads from it.
+  - name: Setup Platform Bindings
+    container: gmt-playwright-nodejs
+    hidden: true
+    commands:
+      - type: playwright
+        shell: bash
+        command: |
+          S = {
+            root: "https://__GMT_VAR_INSTANCE__/",
+            login: "https://__GMT_VAR_INSTANCE__/auth/sign_in",
+            home: "https://__GMT_VAR_INSTANCE__/home",
+            anchor: "https://__GMT_VAR_INSTANCE__/@techcrunch@threads.net",
+            notifications: "https://__GMT_VAR_INSTANCE__/notifications",
+            explore: "https://__GMT_VAR_INSTANCE__/explore",
+            consent: [],
+            post: "article",
+            photo: ".media-gallery__item img, .media-gallery img, .status__media img",
+            like: `button[title="Favourite"]`,
+            unlike: `button[title="Remove from favourites"]`,
+            search: "input.search__input",
+            composer: "form.compose-form textarea",
+            publish: "form.compose-form button.button--block",
+            feedHover: ".scrollable",
+            scrollRoot: ".scrollable",
+            tabs: [`a[href$="/explore"]`, `a[href$="/notifications"]`, `a[href$="/favourites"]`, `a[href$="/lists"]`, `a[href$="/home"]`]
+          };
+
+          GMT_POST_TEXT = "This is an automated measurement post that will be deleted in a few minutes: Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.";
+  # Fills the squid cache with the static app shell, then throws the context away
+  # so the measured login below starts with cold cookies but a warm HTTP cache.
+  - name: Warm Cache
+    container: gmt-playwright-nodejs
+    hidden: true
+    commands:
+      - type: playwright
+        shell: bash
+        command: |
+          await gmtNewContext();
+          await page.goto(S.root, {waitUntil: "load"});
+          await sleep(8000);
+      - type: playwright
+        shell: bash
+        command: |
+          await gmtNewContext();
+  - name: Login
+    container: gmt-playwright-nodejs
+    commands:
+      - type: playwright
+        shell: bash
+        command: |
+          await page.goto(S.login, {waitUntil: "domcontentloaded"});
+          await sleep(3000);
+          await gmtDismissConsent();
+          // Probed 2026-08-20: confirmed live against mastodon.social.
+          await gmtType(page.locator("#user_email"), process.env.GMT_SM_USERNAME);
+          await gmtHuman();
+          await gmtType(page.locator("#user_password"), process.env.GMT_SM_PASSWORD);
+          await gmtHuman();
+          await page.locator(`form button[type="submit"]`).first().click();
+          await sleep(10000);
+          await gmtReportPage();
+  - name: Load Home Feed
+    container: gmt-playwright-nodejs
+    commands:
+      - type: playwright
+        shell: bash
+        command: |
+          await gmtOpenFeed(S.home);
+      - type: playwright
+        shell: bash
+        command: |
+          if (page_result && !page_result.ok()) throw `Home feed was not accessible. HTTP return code ${page_result.status()}`
+  # Nothing is driven here. Whatever is measured is the platform polling,
+  # animating, prefetching or running timers entirely on its own.
+  - name: Idle On Home Feed
+    container: gmt-playwright-nodejs
+    commands:
+      - type: console
+        command: sleep 5
+      - type: playwright
+        shell: bash
+        command: |
+          await gmtReportPage();
+  - name: Scroll Home Feed Timed
+    container: gmt-playwright-nodejs
+    commands:
+      - type: playwright
+        shell: bash
+        command: |
+          gmtScrollReset();
+      - type: playwright
+        shell: bash
+        command: |
+          await gmtScrollChunk(20);
+      - type: playwright
+        shell: bash
+        command: |
+          await gmtScrollReport(S.post);
+  # Same feed, fixed distance instead of fixed time. Compared against the timed
+  # step above this separates "slow to load" from "expensive to render".
+  - name: Scroll Home Feed Fixed Ticks
+    container: gmt-playwright-nodejs
+    commands:
+      - type: playwright
+        shell: bash
+        command: |
+          await gmtOpenFeed(S.home);
+          await gmtTop();
+      - type: playwright
+        shell: bash
+        command: |
+          gmtScrollReset();
+      - type: playwright
+        shell: bash
+        command: |
+          await gmtTickChunk(25);
+      - type: playwright
+        shell: bash
+        command: |
+          await gmtScrollReport(S.post);
+  - name: Scroll Back To Top
+    container: gmt-playwright-nodejs
+    commands:
+      - type: playwright
+        shell: bash
+        command: |
+          await gmtTop();
+          await gmtReportPage();
+  # The cross-platform anchor: the same publisher, read on every platform.
+  - name: Load Anchor Feed
+    container: gmt-playwright-nodejs
+    commands:
+      - type: playwright
+        shell: bash
+        command: |
+          await gmtOpenFeed(S.anchor);
+  - name: Scroll Anchor Feed Timed
+    container: gmt-playwright-nodejs
+    commands:
+      - type: playwright
+        shell: bash
+        command: |
+          gmtScrollReset();
+      - type: playwright
+        shell: bash
+        command: |
+          await gmtScrollChunk(20);
+      - type: playwright
+        shell: bash
+        command: |
+          await gmtScrollReport(S.post);
+  - name: Open Post And Thread
+    container: gmt-playwright-nodejs
+    commands:
+      - type: playwright
+        shell: bash
+        command: |
+          await gmtTop();
+          const first = await gmtNeed(page.locator(S.post), "a feed post");
+          if (!first) { return; }
+          await first.click();
+          await sleep(6000);
+          gmtScrollReset();
+          await gmtTickChunk(10);
+          await gmtScrollReport(S.post);
+  - name: Open Image Lightbox
+    container: gmt-playwright-nodejs
+    commands:
+      - type: playwright
+        shell: bash
+        command: |
+          await page.goto(S.anchor, {waitUntil: "domcontentloaded"});
+          await sleep(6000);
+          let photo = page.locator(S.photo);
+          if (!await gmtVisible(photo)) {
+            await page.goto(S.explore, {waitUntil: "domcontentloaded"});
+            await sleep(6000);
+            photo = page.locator(S.photo);
+          }
+          if (await gmtVisible(photo)) {
+            await photo.first().click();
+            await sleep(5000);
+            await page.keyboard.press("ArrowRight");
+            await sleep(3000);
+            await page.keyboard.press("Escape");
+            await sleep(2000);
+          } else { logNote("WARNING no image matched the lightbox selector"); }
+          await gmtReportPage();
+  - name: Search With Typing
+    container: gmt-playwright-nodejs
+    commands:
+      - type: playwright
+        shell: bash
+        command: |
+          await page.goto(S.explore, {waitUntil: "domcontentloaded"});
+          await sleep(6000);
+          const box = await gmtNeed(page.locator(S.search), "search box");
+          if (!box) { return; }
+          await gmtType(box, "green software engineering");
+          await sleep(4000);
+          await box.press("Enter");
+          await sleep(8000);
+          gmtScrollReset();
+          await gmtTickChunk(10);
+          await gmtScrollReport(S.post);
+  - name: Compose And Publish Post
+    container: gmt-playwright-nodejs
+    commands:
+      - type: playwright
+        shell: bash
+        command: |
+          await page.goto(S.home, {waitUntil: "domcontentloaded"});
+          await sleep(6000);
+          gmtBox = await gmtNeed(page.locator(S.composer), "composer");
+      - type: playwright
+        shell: bash
+        command: |
+          if (!gmtBox) { return; }
+          await gmtType(gmtBox, GMT_POST_TEXT);
+          await sleep(3000);
+          await gmtClick(page.getByRole("button", {name: /^Post$/i}), "publish");
+          await sleep(8000);
+          await gmtReportPage();
+  - name: Delete Published Post
+    container: gmt-playwright-nodejs
+    commands:
+      - type: playwright
+        shell: bash
+        command: |
+          await page.goto(S.home, {waitUntil: "domcontentloaded"});
+          await sleep(8000);
+          const own = page.locator(S.post).filter({hasText: "automated measurement post"}).first();
+          if (!await gmtVisible(own)) { logNote("WARNING could not find own post to delete"); return; }
+          if (!await gmtClick(own.locator(`button[title="More"], button[aria-label="More"]`), "status more menu")) { return; }
+          await sleep(2500);
+          // Verified live 2026-08-20: these entries are plain buttons in .dropdown-menu with no
+          // role=menuitem, and the anchored regex keeps Delete from matching Delete & re-draft.
+          await gmtClick(page.locator(".dropdown-menu").getByText(/^Delete$/), "delete menu item");
+          await sleep(2500);
+          const confirm = page.getByRole("button", {name: /^Delete$/i});
+          if (await gmtVisible(confirm)) { await gmtClick(confirm, "confirm delete"); }
+          await sleep(5000);
+  - name: Like And Unlike
+    container: gmt-playwright-nodejs
+    commands:
+      - type: playwright
+        shell: bash
+        command: |
+          await gmtOpenFeed(S.anchor);
+          // A like left behind by an earlier run would make this one a no-op, and on platforms
+          // where the control renames itself when active (Mastodon: Favourite -> Remove from
+          // favourites) it would never be found again. Clear it first, then measure the real toggle.
+          if (S.unlike && await gmtVisible(page.locator(S.unlike))) {
+            await gmtClick(page.locator(S.unlike), "clearing a like left by an earlier run");
+            await sleep(3000);
+          }
+          const like = page.locator(S.like).first();
+          if (!await gmtVisible(like)) { logNote("WARNING no like control matched"); return; }
+          await gmtClick(like, "like");
+          await sleep(4000);
+          const undo = page.locator(S.unlike ? S.unlike : S.like).first();
+          if (await gmtVisible(undo)) { await gmtClick(undo, "unlike"); await sleep(4000); }
+          else { logNote("WARNING could not undo the like - it is still set on the anchor account"); }
+          await gmtReportPage();
+  - name: Open Notifications
+    container: gmt-playwright-nodejs
+    commands:
+      - type: playwright
+        shell: bash
+        command: |
+          await page.goto(S.notifications, {waitUntil: "domcontentloaded"});
+          await sleep(8000);
+          gmtScrollReset();
+          await gmtTickChunk(10);
+          await gmtScrollReport(S.post);
+  - name: Navigate Tabs
+    container: gmt-playwright-nodejs
+    commands:
+      - type: playwright
+        shell: bash
+        command: |
+          await page.goto(S.home, {waitUntil: "domcontentloaded"});
+          await sleep(6000);
+      - type: playwright
+        shell: bash
+        command: |
+          const l = page.locator(S.tabs[0]).first();
+          if (await gmtVisible(l)) { await gmtClick(l, "nav tab 0"); await sleep(6000); }
+          else { logNote("WARNING nav tab 0 not found"); }
+      - type: playwright
+        shell: bash
+        command: |
+          const l = page.locator(S.tabs[1]).first();
+          if (await gmtVisible(l)) { await gmtClick(l, "nav tab 1"); await sleep(6000); }
+          else { logNote("WARNING nav tab 1 not found"); }
+      - type: playwright
+        shell: bash
+        command: |
+          const l = page.locator(S.tabs[2]).first();
+          if (await gmtVisible(l)) { await gmtClick(l, "nav tab 2"); await sleep(6000); }
+          else { logNote("WARNING nav tab 2 not found"); }
+      - type: playwright
+        shell: bash
+        command: |
+          const l = page.locator(S.tabs[3]).first();
+          if (await gmtVisible(l)) { await gmtClick(l, "nav tab 3"); await sleep(6000); }
+          else { logNote("WARNING nav tab 3 not found"); }
+      - type: playwright
+        shell: bash
+        command: |
+          const l = page.locator(S.tabs[4]).first();
+          if (await gmtVisible(l)) { await gmtClick(l, "nav tab 4"); await sleep(6000); }
+          else { logNote("WARNING nav tab 4 not found"); }
+      - type: playwright
+        shell: bash
+        command: |
+          await gmtReportPage();
+  - name: Background Tab Idle
+    container: gmt-playwright-nodejs
+    commands:
+      - type: playwright
+        shell: bash
+        command: |
+          await page.goto(S.home, {waitUntil: "domcontentloaded"});
+          await sleep(6000);
+          bgPage = await context.newPage();
+          await bgPage.goto("about:blank");
+          await bgPage.bringToFront();
+      - type: console
+        command: sleep 5
+      - type: playwright
+        shell: bash
+        command: |
+          await page.bringToFront();
+          await sleep(3000);
+          await bgPage.close();
+          await gmtReportPage();
+  - name: Logout
+    container: gmt-playwright-nodejs
+    commands:
+      - type: playwright
+        shell: bash
+        command: |
+          const more = await gmtNeed(page.locator(".navigation-panel").getByRole("button", {name: /^More$/i}), "navigation More menu");
+          if (!more) { return; }
+          await more.click();
+          await sleep(2000);
+          await page.getByRole("button", {name: /^Logout$/i}).first().click();
+          await sleep(3000);
+          const confirm = page.getByRole("button", {name: /^Logout$/i});
+          if (await gmtVisible(confirm)) { await confirm.first().click(); }
+          await sleep(6000);
+          await gmtReportPage();
